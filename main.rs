@@ -5,7 +5,7 @@
 
 mod engines;
 
-use engines::{Engine, Supervisor, SOCKS_PORT};
+use engines::{Engine, Supervisor};
 use serde::Serialize;
 use std::sync::Mutex;
 use tauri::{Manager, State};
@@ -18,19 +18,37 @@ struct AppState {
 struct Status {
     running: bool,
     engine: Option<String>,
-    socks: String,
+    socks: Option<String>,
+    region: String,
+}
+
+fn snapshot(sup: &mut Supervisor) -> Status {
+    let running = sup.is_running();
+    Status {
+        running,
+        engine: sup.current().map(|e| e.label().to_string()),
+        socks: sup.socks_port().map(|p| format!("127.0.0.1:{p}")),
+        region: sup.region().to_string(),
+    }
 }
 
 #[tauri::command]
-fn start_engine(engine: String, state: State<'_, AppState>) -> Result<Status, String> {
+fn start_engine(
+    engine: String,
+    region: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Status, String> {
     let picked = Engine::parse(&engine).ok_or_else(|| format!("unknown engine: {engine}"))?;
     let mut sup = state.supervisor.lock().map_err(|e| e.to_string())?;
-    sup.start(picked, SOCKS_PORT).map_err(|e| e.to_string())?;
-    Ok(Status {
-        running: true,
-        engine: Some(picked.label().to_string()),
-        socks: format!("127.0.0.1:{SOCKS_PORT}"),
-    })
+    sup.start_in(picked, region.as_deref().unwrap_or(""))
+        .map_err(|e| e.to_string())?;
+    Ok(snapshot(&mut sup))
+}
+
+/// The exit countries to offer before the engine has listed its own.
+#[tauri::command]
+fn regions() -> Vec<String> {
+    engines::REGIONS.iter().map(|s| s.to_string()).collect()
 }
 
 #[tauri::command]
@@ -43,12 +61,7 @@ fn stop_engine(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 fn engine_status(state: State<'_, AppState>) -> Result<Status, String> {
     let mut sup = state.supervisor.lock().map_err(|e| e.to_string())?;
-    let running = sup.is_running();
-    Ok(Status {
-        running,
-        engine: sup.current().map(|e| e.label().to_string()),
-        socks: format!("127.0.0.1:{SOCKS_PORT}"),
-    })
+    Ok(snapshot(&mut sup))
 }
 
 #[tauri::command]
@@ -60,13 +73,19 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // Cores are bundled as resources next to the executable.
-            let dir = app
+            // Cores ship as resources next to the executable; engine state goes
+            // in the per-user data directory so nothing is written into
+            // Program Files.
+            let resources = app
                 .path()
                 .resolve("resources", tauri::path::BaseDirectory::Resource)
                 .unwrap_or_else(|_| std::path::PathBuf::from("resources"));
+            let data = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("panther"));
             app.manage(AppState {
-                supervisor: Mutex::new(Supervisor::new(dir)),
+                supervisor: Mutex::new(Supervisor::new(resources, data)),
             });
             Ok(())
         })
@@ -74,6 +93,7 @@ fn main() {
             start_engine,
             stop_engine,
             engine_status,
+            regions,
             app_version
         ])
         .run(tauri::generate_context!())
