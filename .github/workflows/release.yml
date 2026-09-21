@@ -1,0 +1,135 @@
+name: Windows release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to publish the installer under (leave empty to build only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    # The engine logic is plain std Rust, so prove it on a fast runner before
+    # spending minutes on a Windows bundle.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test the engine module on its own
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/enginecheck/src /tmp/enginecheck/tests
+          cp engines.rs /tmp/enginecheck/src/lib.rs
+          # The live test spawns a stand-in core that really binds the port, so
+          # a supervisor that silently stopped working fails here.
+          sed 's/use engcheck::\*;/use enginecheck::*;/' live.rs > /tmp/enginecheck/tests/live.rs
+          cat > /tmp/enginecheck/Cargo.toml <<'TOML'
+          [package]
+          name = "enginecheck"
+          version = "0.0.0"
+          edition = "2021"
+          TOML
+          cd /tmp/enginecheck
+          cargo test
+
+  build:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Assemble the project layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pillow
+          bash assemble.sh
+
+      - name: Fetch the Aether core
+        shell: bash
+        env:
+          AETHER_VERSION: v1.0.0
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/resources
+          asset="aether-windows-x86_64.zip"
+          base="https://github.com/CluvexStudio/Aether/releases/download/${AETHER_VERSION}"
+          curl -fsSL -o /tmp/aether.zip "$base/$asset"
+          curl -fsSL -o /tmp/aether.sha256 "$base/$asset.sha256" || true
+          if [ -s /tmp/aether.sha256 ]; then
+            want=$(tr -d '\r' < /tmp/aether.sha256 | awk '{print $1}')
+            got=$(sha256sum /tmp/aether.zip | awk '{print $1}')
+            if [ "$want" != "$got" ]; then
+              echo "Aether checksum mismatch: expected $want, got $got" >&2
+              exit 1
+            fi
+            echo "checksum verified"
+          else
+            echo "no checksum published for $asset - continuing without it" >&2
+          fi
+          unzip -o -q /tmp/aether.zip -d /tmp/aether
+          exe=$(find /tmp/aether -name 'aether*.exe' | head -n 1)
+          if [ -z "$exe" ]; then
+            echo "aether.exe was not in the archive; contents were:" >&2
+            find /tmp/aether -type f >&2
+            exit 1
+          fi
+          cp "$exe" src-tauri/resources/aether.exe
+
+      - name: Refuse to ship without the core
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s src-tauri/resources/aether.exe
+          test -s src-tauri/icons/icon.ico
+          test -s src/logo.png
+          echo "core: $(stat -c%s src-tauri/resources/aether.exe) bytes"
+
+      - name: Build the installer
+        run: cargo tauri build --verbose
+        working-directory: .
+
+      - name: Collect the artefacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find src-tauri/target/release/bundle -type f \( -name '*.exe' -o -name '*.msi' \) -print -exec cp {} dist/ \;
+          test -n "$(ls -A dist)" || { echo "no installer was produced" >&2; exit 1; }
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Panther-Desktop-Windows
+          path: dist/*
+
+      - name: Publish the failure log
+        if: failure()
+        shell: bash
+        run: |
+          echo "The build failed. Open the step above marked with a red cross for the reason." >&2
+
+      - name: Publish the release
+        if: success() && (github.event_name == 'push' || inputs.release_tag != '')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
