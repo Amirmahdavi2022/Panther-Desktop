@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Panther VPN for Windows"
 authors = ["JMC"]
-license = "GPL-3.0"
+license = "AGPL-3.0"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
