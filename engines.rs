@@ -194,10 +194,10 @@ pub fn json_string(value: &str) -> String {
 /// `write_global_config` and passed in.
 pub fn args_for(step: Step, config: Option<&Path>) -> Vec<String> {
     match step.engine {
-        // Flags from Aether's own README: --masque is the documented main
-        // transport and --bind fixes the local SOCKS5 address.
+        // Only the address goes on the command line. Everything else about how
+        // Aether connects is set through `env_for`, the same way the Android
+        // build does it.
         Engine::Aether => vec![
-            "--masque".into(),
             "--bind".into(),
             format!("127.0.0.1:{}", step.port),
         ],
@@ -211,6 +211,46 @@ pub fn args_for(step: Step, config: Option<&Path>) -> Vec<String> {
             config.map(|p| p.display().to_string()).unwrap_or_default(),
         ],
     }
+}
+
+/// Environment for one step. For Aether these are the Android build's
+/// defaults, which are what actually connects on the networks this app is for:
+/// the gool (warp-in-warp) protocol, turbo scan, IPv4, the firewall noise
+/// profile. The desktop build first shipped with `--masque` on an older core
+/// and never connected, so the two platforms are kept identical on purpose.
+pub fn env_for(step: Step, data: &Path) -> Vec<(String, String)> {
+    match step.engine {
+        Engine::Aether => vec![
+            ("AETHER_PROTOCOL".into(), "gool".into()),
+            ("AETHER_SCAN".into(), "turbo".into()),
+            ("AETHER_IP".into(), "v4".into()),
+            ("AETHER_NOIZE".into(), "firewall".into()),
+            ("AETHER_LOG_LEVEL".into(), "info".into()),
+            ("AETHER_QUICK_RECONNECT".into(), "1".into()),
+            ("AETHER_WG_STALE_SECS".into(), "30".into()),
+            ("AETHER_SOCKS".into(), format!("127.0.0.1:{}", step.port)),
+            // Its identity file. Left alone it lands in the working directory.
+            ("AETHER_CONFIG".into(), data.join("aether.toml").display().to_string()),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// How long a step may take to open its port. Matches the Android build:
+/// Aether's first run has to register an account and scan for a gateway
+/// before it listens, which regularly takes well over the 45 s this used to
+/// allow, and Global needs longer again because it rides on Aether.
+pub fn step_timeout(engine: Engine) -> Duration {
+    match engine {
+        Engine::Global => Duration::from_secs(150),
+        _ => Duration::from_secs(120),
+    }
+}
+
+/// Where a core's output goes. Rewritten on every start, so it always holds
+/// the attempt that just happened.
+pub fn log_path(data: &Path, engine: Engine) -> PathBuf {
+    data.join("logs").join(format!("{}.log", engine.binary_stem()))
 }
 
 /// True once something is accepting connections on the local port. This is the
@@ -303,11 +343,31 @@ impl Supervisor {
                 _ => None,
             };
 
+            // The core's own output is the only way to see why a connection
+            // failed on someone else's machine, so it goes to a file.
+            let log = log_path(&self.data, step.engine);
+            let (out, err) = match log.parent().map(fs::create_dir_all) {
+                Some(Ok(())) => match fs::File::create(&log) {
+                    Ok(f) => match f.try_clone() {
+                        Ok(g) => (Stdio::from(f), Stdio::from(g)),
+                        Err(_) => (Stdio::from(f), Stdio::null()),
+                    },
+                    Err(_) => (Stdio::null(), Stdio::null()),
+                },
+                _ => (Stdio::null(), Stdio::null()),
+            };
+
             let mut cmd = Command::new(&bin);
             cmd.args(args_for(*step, config.as_deref()))
+                .envs(env_for(*step, &self.data))
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+                .stdout(out)
+                .stderr(err);
+            // A writable place of its own, rather than wherever the app was
+            // launched from.
+            if fs::create_dir_all(&self.data).is_ok() {
+                cmd.current_dir(&self.data);
+            }
 
             // Keep a console window from flashing up on Windows.
             #[cfg(windows)]
@@ -327,11 +387,43 @@ impl Supervisor {
 
             // The first hop has to find a route before the next one can use it,
             // so each step gets its own generous window.
-            if !wait_for_port(step.port, Duration::from_secs(45)) {
+            // Watch the process as well as the port: a core that has already
+            // exited is never going to open it, and waiting out the full
+            // timeout for a dead process just looks like a hang.
+            let deadline = Instant::now() + step_timeout(step.engine);
+            let mut up = false;
+            while Instant::now() < deadline {
+                if port_is_open(step.port) {
+                    up = true;
+                    break;
+                }
+                let exited = self
+                    .children
+                    .last_mut()
+                    .map(|c| matches!(c.try_wait(), Ok(Some(_))))
+                    .unwrap_or(true);
+                if exited {
+                    self.stop();
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!(
+                            "{} exited before it could connect; see {}",
+                            step.engine.label(),
+                            log.display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if !up {
                 self.stop();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("{} started but never accepted connections", step.engine.label()),
+                    format!(
+                        "{} started but never accepted connections; see {}",
+                        step.engine.label(),
+                        log.display()
+                    ),
                 ));
             }
         }
@@ -418,7 +510,27 @@ mod tests {
         let step = Step { engine: Engine::Aether, port: 1819, upstream: None };
         let args = args_for(step, None).join(" ");
         assert!(args.contains("127.0.0.1:1819"), "got: {args}");
-        assert!(args.contains("--masque"), "got: {args}");
+    }
+
+    #[test]
+    fn aether_gets_the_android_settings() {
+        let step = Step { engine: Engine::Aether, port: 1819, upstream: None };
+        let env = env_for(step, Path::new("data"));
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(get("AETHER_PROTOCOL").as_deref(), Some("gool"));
+        assert_eq!(get("AETHER_SCAN").as_deref(), Some("turbo"));
+        assert_eq!(get("AETHER_IP").as_deref(), Some("v4"));
+        assert_eq!(get("AETHER_NOIZE").as_deref(), Some("firewall"));
+        assert_eq!(get("AETHER_SOCKS").as_deref(), Some("127.0.0.1:1819"));
+        assert!(get("AETHER_CONFIG").unwrap().ends_with("aether.toml"));
+        // masque never connected on the desktop build; keep it off the command line.
+        assert!(!args_for(step, None).iter().any(|a| a == "--masque"));
+    }
+
+    #[test]
+    fn timeouts_match_the_android_build() {
+        assert_eq!(step_timeout(Engine::Aether), Duration::from_secs(120));
+        assert_eq!(step_timeout(Engine::Global), Duration::from_secs(150));
     }
 
     #[test]
