@@ -48,6 +48,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
@@ -93,14 +97,34 @@ jobs:
           fi
           cp "$exe" src-tauri/resources/aether.exe
 
+      - name: Build the Global core
+        shell: bash
+        env:
+          GLOBAL_CORE_VERSION: v2.0.40
+        run: |
+          set -euo pipefail
+          # No Windows binary is published, but the core is plain Go, so it is
+          # built from the same tag the Android build pins. Building beats
+          # trusting an unpublished asset.
+          git clone --quiet --branch "$GLOBAL_CORE_VERSION" --depth 1 \
+            https://github.com/Psiphon-Labs/psiphon-tunnel-core.git /tmp/global-src
+          cd /tmp/global-src
+          echo "building ConsoleClient with $(go version)"
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w" -o /tmp/global.exe ./ConsoleClient
+          cd "$GITHUB_WORKSPACE"
+          cp /tmp/global.exe src-tauri/resources/global.exe
+
       - name: Refuse to ship without the core
         shell: bash
         run: |
           set -euo pipefail
           test -s src-tauri/resources/aether.exe
+          test -s src-tauri/resources/global.exe
           test -s src-tauri/icons/icon.ico
           test -s src/logo.png
-          echo "core: $(stat -c%s src-tauri/resources/aether.exe) bytes"
+          echo "aether: $(stat -c%s src-tauri/resources/aether.exe) bytes"
+          echo "global: $(stat -c%s src-tauri/resources/global.exe) bytes"
 
       - name: Build the installer
         run: cargo tauri build --verbose
