@@ -1,5 +1,0 @@
-target/
-node_modules/
-dist/
-src-tauri/gen/
-*.log
