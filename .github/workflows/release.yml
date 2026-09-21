@@ -59,12 +59,17 @@ jobs:
       - name: Install the Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Assemble the project layout
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --quiet pillow
           bash assemble.sh
+          ls -la src-tauri/icons src/
 
       - name: Fetch the Aether core
         shell: bash
@@ -88,7 +93,9 @@ jobs:
           else
             echo "no checksum published for $asset - continuing without it" >&2
           fi
-          unzip -o -q /tmp/aether.zip -d /tmp/aether
+          # Git Bash on the Windows runner has no unzip, but it does have the
+          # Python we just installed Pillow into.
+          python -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" /tmp/aether.zip /tmp/aether
           exe=$(find /tmp/aether -name 'aether*.exe' | head -n 1)
           if [ -z "$exe" ]; then
             echo "aether.exe was not in the archive; contents were:" >&2
@@ -123,8 +130,8 @@ jobs:
           test -s src-tauri/resources/global.exe
           test -s src-tauri/icons/icon.ico
           test -s src/logo.png
-          echo "aether: $(stat -c%s src-tauri/resources/aether.exe) bytes"
-          echo "global: $(stat -c%s src-tauri/resources/global.exe) bytes"
+          echo "aether: $(wc -c < src-tauri/resources/aether.exe) bytes"
+          echo "global: $(wc -c < src-tauri/resources/global.exe) bytes"
 
       - name: Build the installer
         run: cargo tauri build --verbose
