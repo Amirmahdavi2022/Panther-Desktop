@@ -74,7 +74,7 @@ jobs:
       - name: Fetch the Aether core
         shell: bash
         env:
-          AETHER_VERSION: v1.0.0
+          AETHER_VERSION: v2.0.0
         run: |
           set -euo pipefail
           mkdir -p src-tauri/resources
