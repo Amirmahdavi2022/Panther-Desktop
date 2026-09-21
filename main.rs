@@ -32,8 +32,11 @@ fn snapshot(sup: &mut Supervisor) -> Status {
     }
 }
 
+// Async so Tauri runs it on a worker thread. A plain `fn` command runs on the
+// main thread, and starting an engine waits up to 45 s per step for its port,
+// which froze the whole window until it finished.
 #[tauri::command]
-fn start_engine(
+async fn start_engine(
     engine: String,
     region: Option<String>,
     state: State<'_, AppState>,
@@ -52,14 +55,14 @@ fn regions() -> Vec<String> {
 }
 
 #[tauri::command]
-fn stop_engine(state: State<'_, AppState>) -> Result<(), String> {
+async fn stop_engine(state: State<'_, AppState>) -> Result<(), String> {
     let mut sup = state.supervisor.lock().map_err(|e| e.to_string())?;
     sup.stop();
     Ok(())
 }
 
 #[tauri::command]
-fn engine_status(state: State<'_, AppState>) -> Result<Status, String> {
+async fn engine_status(state: State<'_, AppState>) -> Result<Status, String> {
     let mut sup = state.supervisor.lock().map_err(|e| e.to_string())?;
     Ok(snapshot(&mut sup))
 }
