@@ -21,6 +21,12 @@ pub const AETHER_PORT: u16 = 1819;
 pub const GLOBAL_PORT: u16 = 1820;
 /// Prowl's port, kept distinct for the same reason.
 pub const PROWL_PORT: u16 = 1821;
+/// sing-box's local control API. Nothing talks to it; it opening is simply the
+/// signal that sing-box got through its start-up, TUN included.
+pub const TUN_API_PORT: u16 = 1830;
+/// The processes whose own traffic must never be sent back into the tunnel,
+/// or every packet they send would loop through themselves.
+pub const TUN_BYPASS: &[&str] = &["aether.exe", "global.exe", "prowl.exe", "sing-box.exe"];
 
 // Taken from the Android build's Global engine so both platforms speak to the
 // same network with the same identity. Attribution lives in NOTICE.md.
@@ -253,6 +259,175 @@ pub fn log_path(data: &Path, engine: Engine) -> PathBuf {
     data.join("logs").join(format!("{}.log", engine.binary_stem()))
 }
 
+pub fn tun_binary(resources: &Path) -> PathBuf {
+    if cfg!(windows) {
+        resources.join("sing-box.exe")
+    } else {
+        resources.join("sing-box")
+    }
+}
+
+/// The whole-system tunnel: sing-box owns a TUN adapter, takes every app's
+/// traffic and hands it to the engine's local SOCKS port. This is what makes
+/// the desktop build a real VPN instead of a proxy people have to configure.
+///
+/// - The cores themselves go out directly (`TUN_BYPASS`), or their own traffic
+///   would be fed back into them.
+/// - DNS is answered inside the tunnel, over TCP through the engine, so the ISP
+///   never sees the lookups. IPv4 only, because the engines are IPv4 only;
+///   IPv6 is captured and refused so apps fall back to IPv4 at once instead of
+///   leaking around the tunnel or hanging.
+/// - Validated with `sing-box check` against the pinned version (1.13.21).
+pub fn tun_config(socks_port: u16) -> String {
+    let bypass = TUN_BYPASS
+        .iter()
+        .map(|p| json_string(p))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{
+  "log": {{"level": "warn", "timestamp": true}},
+  "dns": {{
+    "servers": [{{"type": "tcp", "tag": "remote", "server": "1.1.1.1", "detour": "proxy"}}],
+    "strategy": "ipv4_only",
+    "final": "remote"
+  }},
+  "inbounds": [{{
+    "type": "tun",
+    "tag": "tun-in",
+    "interface_name": "Panther",
+    "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+    "mtu": 9000,
+    "auto_route": true,
+    "strict_route": true,
+    "stack": "mixed"
+  }}],
+  "outbounds": [
+    {{"type": "socks", "tag": "proxy", "server": "127.0.0.1", "server_port": {socks_port}, "version": "5"}},
+    {{"type": "direct", "tag": "direct"}}
+  ],
+  "route": {{
+    "auto_detect_interface": true,
+    "find_process": true,
+    "rules": [
+      {{"process_name": [{bypass}], "outbound": "direct"}},
+      {{"action": "sniff"}},
+      {{"protocol": "dns", "action": "hijack-dns"}},
+      {{"ip_is_private": true, "outbound": "direct"}},
+      {{"ip_version": 6, "action": "reject"}}
+    ],
+    "final": "proxy"
+  }},
+  "experimental": {{
+    "clash_api": {{"external_controller": "127.0.0.1:{TUN_API_PORT}"}}
+  }}
+}}
+"#
+    )
+}
+
+/// Asks, through the engine itself, which address and country the internet
+/// sees. The app shows this instead of trusting what was requested, so a
+/// country that was asked for but not granted is visible rather than hidden.
+///
+/// Plain HTTP on purpose: the request already travels inside the tunnel, and
+/// it keeps this free of a TLS stack. ip-api.com's free endpoint is HTTP only.
+pub fn exit_check(socks_port: u16) -> io::Result<(String, String)> {
+    exit_check_via(socks_port, "ip-api.com", 80, "/json/?fields=query,countryCode")
+}
+
+pub fn exit_check_via(
+    socks_port: u16,
+    host: &str,
+    port: u16,
+    path: &str,
+) -> io::Result<(String, String)> {
+    use std::io::{Read, Write};
+    let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+
+    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socks_port);
+    let mut s = TcpStream::connect_timeout(&addr.into(), Duration::from_secs(5))?;
+    s.set_read_timeout(Some(Duration::from_secs(15)))?;
+    s.set_write_timeout(Some(Duration::from_secs(15)))?;
+
+    // SOCKS5, no authentication, CONNECT by host name so the lookup happens at
+    // the far end of the tunnel.
+    s.write_all(&[5, 1, 0])?;
+    let mut reply = [0u8; 2];
+    s.read_exact(&mut reply)?;
+    if reply != [5, 0] {
+        return Err(bad("socks: no acceptable auth method"));
+    }
+    if host.len() > 255 {
+        return Err(bad("socks: host name too long"));
+    }
+    let mut req = vec![5, 1, 0, 3, host.len() as u8];
+    req.extend_from_slice(host.as_bytes());
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req)?;
+    let mut head = [0u8; 4];
+    s.read_exact(&mut head)?;
+    if head[1] != 0 {
+        return Err(bad("socks: connect refused"));
+    }
+    let skip = match head[3] {
+        1 => 4 + 2,
+        4 => 16 + 2,
+        3 => {
+            let mut n = [0u8; 1];
+            s.read_exact(&mut n)?;
+            n[0] as usize + 2
+        }
+        _ => return Err(bad("socks: bad reply")),
+    };
+    let mut rest = vec![0u8; skip];
+    s.read_exact(&mut rest)?;
+
+    // One write for the whole request, so it leaves as one piece.
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Panther\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(request.as_bytes())?;
+    // Stop at the end of the JSON object rather than waiting for the far end
+    // to close: some proxies keep the socket open well after the reply.
+    let mut body = String::new();
+    let mut buf = [0u8; 2048];
+    loop {
+        let n = match s.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if body.is_empty() => return Err(e),
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        body.push_str(&String::from_utf8_lossy(&buf[..n]));
+        if let Some(h) = body.find("\r\n\r\n") {
+            if body[h..].contains('}') {
+                break;
+            }
+        }
+        if body.len() > 64 * 1024 {
+            break;
+        }
+    }
+
+    let ip = json_field(&body, "query").ok_or_else(|| bad("no address in the reply"))?;
+    let cc = json_field(&body, "countryCode").unwrap_or_default();
+    Ok((ip, cc))
+}
+
+/// Pulls a flat string field out of a small JSON reply. Enough for the two
+/// fields read here without pulling in a JSON parser.
+pub fn json_field(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let at = body.find(&needle)? + needle.len();
+    let rest = body[at..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 /// True once something is accepting connections on the local port. This is the
 /// only honest signal that an engine is up: a process that started and then
 /// died would otherwise look like success.
@@ -279,6 +454,7 @@ pub struct Supervisor {
     region: String,
     resources: PathBuf,
     data: PathBuf,
+    tunnel: bool,
 }
 
 impl Supervisor {
@@ -290,7 +466,15 @@ impl Supervisor {
             region: String::new(),
             resources,
             data,
+            tunnel: false,
         }
+    }
+
+    /// Whole-system mode: after the engine is up, sing-box routes every app
+    /// through it. Off by default so the engine logic can be tested without a
+    /// TUN adapter; the app turns it on.
+    pub fn set_tunnel(&mut self, on: bool) {
+        self.tunnel = on;
     }
 
     pub fn current(&self) -> Option<Engine> {
@@ -357,6 +541,9 @@ impl Supervisor {
                 _ => (Stdio::null(), Stdio::null()),
             };
 
+            // Absolute, because the child is started in another directory and a
+            // relative program path would be looked up from there.
+            let bin = std::path::absolute(&bin).unwrap_or(bin);
             let mut cmd = Command::new(&bin);
             cmd.args(args_for(*step, config.as_deref()))
                 .envs(env_for(*step, &self.data))
@@ -428,10 +615,88 @@ impl Supervisor {
             }
         }
 
+        if self.tunnel {
+            if let Err(e) = self.start_tunnel(plan.socks) {
+                self.stop();
+                return Err(e);
+            }
+        }
+
         self.current = Some(engine);
         self.socks = Some(plan.socks);
         self.region = region;
         Ok(plan.socks)
+    }
+
+    fn start_tunnel(&mut self, socks_port: u16) -> io::Result<()> {
+        let bin = tun_binary(&self.resources);
+        if !bin.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("the tunnel core was not found at {}", bin.display()),
+            ));
+        }
+        let dir = self.data.join("tunnel");
+        fs::create_dir_all(&dir)?;
+        let config = dir.join("config.json");
+        fs::write(&config, tun_config(socks_port))?;
+
+        let log = self.data.join("logs").join("tunnel.log");
+        let (out, err) = match log.parent().map(fs::create_dir_all) {
+            Some(Ok(())) => match fs::File::create(&log) {
+                Ok(f) => match f.try_clone() {
+                    Ok(g) => (Stdio::from(f), Stdio::from(g)),
+                    Err(_) => (Stdio::from(f), Stdio::null()),
+                },
+                Err(_) => (Stdio::null(), Stdio::null()),
+            },
+            _ => (Stdio::null(), Stdio::null()),
+        };
+
+        let bin = std::path::absolute(&bin).unwrap_or(bin);
+        let config = std::path::absolute(&config).unwrap_or(config);
+        let dir = std::path::absolute(&dir).unwrap_or(dir);
+        let mut cmd = Command::new(&bin);
+        cmd.arg("run")
+            .arg("-c")
+            .arg(&config)
+            .arg("-D")
+            .arg(&dir)
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = cmd.spawn()?;
+
+        // Creating the adapter normally takes a second or two. A failure (no
+        // admin rights, adapter refused) makes sing-box exit, so an exit is
+        // reported at once with the log rather than waited out.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = child.try_wait() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("the tunnel could not start; see {}", log.display()),
+                ));
+            }
+            if port_is_open(TUN_API_PORT) {
+                self.children.push(child);
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("the tunnel did not come up; see {}", log.display()),
+        ))
     }
 
     pub fn stop(&mut self) {
@@ -525,6 +790,75 @@ mod tests {
         assert!(get("AETHER_CONFIG").unwrap().ends_with("aether.toml"));
         // masque never connected on the desktop build; keep it off the command line.
         assert!(!args_for(step, None).iter().any(|a| a == "--masque"));
+    }
+
+    #[test]
+    fn tun_config_points_at_the_engine_and_bypasses_the_cores() {
+        let c = tun_config(1820);
+        assert!(c.contains("\"server_port\": 1820"), "{c}");
+        for p in TUN_BYPASS {
+            assert!(c.contains(&format!("\"{p}\"")), "missing bypass for {p}");
+        }
+        assert!(c.contains(&format!("127.0.0.1:{TUN_API_PORT}")));
+    }
+
+    #[test]
+    fn json_field_reads_the_exit_reply() {
+        let body = "HTTP/1.1 200 OK\r\n\r\n{\"query\": \"203.0.113.7\",\"countryCode\":\"CA\"}";
+        assert_eq!(json_field(body, "query").as_deref(), Some("203.0.113.7"));
+        assert_eq!(json_field(body, "countryCode").as_deref(), Some("CA"));
+        assert_eq!(json_field(body, "missing"), None);
+    }
+
+    /// A real SOCKS5 handshake against a stand-in proxy that forwards to a
+    /// stand-in HTTP server, so the byte-level protocol is exercised end to end.
+    #[test]
+    fn exit_check_speaks_socks5_and_reads_the_answer() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let http = TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_port = http.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut c, _) = http.accept().unwrap();
+            let mut req = String::new();
+            let mut buf = [0u8; 256];
+            while !req.contains("\r\n\r\n") {
+                let n = c.read(&mut buf).unwrap();
+                if n == 0 { break; }
+                req.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            assert!(req.starts_with("GET /json/"), "{req}");
+            c.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"query\":\"198.51.100.4\",\"countryCode\":\"DE\"}").unwrap();
+        });
+
+        let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socks_port = socks.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut c, _) = socks.accept().unwrap();
+            let mut g = [0u8; 3];
+            c.read_exact(&mut g).unwrap();
+            assert_eq!(g, [5, 1, 0]);
+            c.write_all(&[5, 0]).unwrap();
+            let mut h = [0u8; 5];
+            c.read_exact(&mut h).unwrap();
+            assert_eq!(&h[..4], &[5, 1, 0, 3]);
+            let mut name = vec![0u8; h[4] as usize + 2];
+            c.read_exact(&mut name).unwrap();
+            assert_eq!(&name[..name.len() - 2], b"example.test");
+            c.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+            let mut up = TcpStream::connect(("127.0.0.1", http_port)).unwrap();
+            let mut down = up.try_clone().unwrap();
+            let mut c2 = c.try_clone().unwrap();
+            std::thread::spawn(move || { let _ = std::io::copy(&mut c2, &mut up); });
+            let _ = std::io::copy(&mut down, &mut c);
+            let _ = c.shutdown(std::net::Shutdown::Both);
+        });
+
+        let (ip, cc) =
+            exit_check_via(socks_port, "example.test", 80, "/json/?fields=query,countryCode").unwrap();
+        assert_eq!(ip, "198.51.100.4");
+        assert_eq!(cc, "DE");
     }
 
     #[test]

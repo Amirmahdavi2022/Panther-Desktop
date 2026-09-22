@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Panther VPN</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="glow glow-a"></div>
+  <div class="glow glow-b"></div>
+
+  <header class="bar" data-tauri-drag-region>
+    <div class="brand">
+      <img src="logo.png" alt="" class="brand-mark" />
+      <div class="brand-text">
+        <span class="brand-name">PANTHER</span>
+        <span class="brand-sub">VPN · Desktop</span>
+      </div>
+    </div>
+    <div class="bar-right">
+      <span class="ver" id="ver">v1.0.0</span>
+      <button class="icon-btn" id="minBtn" title="کوچک کردن" aria-label="کوچک کردن">
+        <svg viewBox="0 0 16 16"><path d="M3 8h10" /></svg>
+      </button>
+      <button class="icon-btn danger" id="closeBtn" title="بستن" aria-label="بستن">
+        <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section class="stage">
+      <button class="orb" id="power" aria-label="اتصال">
+        <span class="orb-ring r1"></span>
+        <span class="orb-ring r2"></span>
+        <span class="orb-ring r3"></span>
+        <span class="orb-face">
+          <svg class="orb-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 3v9" />
+            <path d="M6.3 6.3a8 8 0 1 0 11.4 0" />
+          </svg>
+        </span>
+      </button>
+
+      <p class="status" id="status">آماده‌ی اتصال</p>
+      <p class="substatus" id="substatus">یک موتور انتخاب کن و دکمه را بزن</p>
+
+      <div class="stats" id="stats">
+        <div class="stat">
+          <span class="stat-k">مدت اتصال</span>
+          <span class="stat-v" id="uptime">۰۰:۰۰</span>
+        </div>
+        <div class="divider"></div>
+        <div class="stat">
+          <span class="stat-k">موتور</span>
+          <span class="stat-v" id="curEngine">—</span>
+        </div>
+        <div class="divider"></div>
+        <div class="stat wide">
+          <span class="stat-k">آی‌پی خروجی</span>
+          <span class="stat-v exit">
+            <span class="flag-slot" id="exitFlag"></span>
+            <span class="mono" id="exitIp">—</span>
+          </span>
+        </div>
+      </div>
+    </section>
+
+    <section class="engines">
+      <h2 class="section-title">موتور اتصال</h2>
+      <div class="engine-list" id="engines">
+        <button class="engine selected" data-engine="aether">
+          <span class="engine-dot"></span>
+          <span class="engine-body">
+            <span class="engine-name">Aether</span>
+            <span class="engine-desc">سریع و پایدار، برای استفاده‌ی روزمره</span>
+          </span>
+          <span class="engine-badge">پیشنهادی</span>
+        </button>
+
+        <button class="engine" data-engine="global">
+          <span class="engine-dot"></span>
+          <span class="engine-body">
+            <span class="engine-name">Global</span>
+            <span class="engine-desc">با انتخاب کشور خروجی، مقاوم‌تر در برابر فیلتر</span>
+          </span>
+        </button>
+
+        <div class="region" id="regionBox" hidden>
+          <span class="region-label">کشور خروجی</span>
+          <button class="region-btn" id="regionBtn" type="button">
+            <span class="flag-slot" id="regionFlag"></span>
+            <span class="region-name" id="regionName">خودکار</span>
+            <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4" /></svg>
+          </button>
+        </div>
+
+        <button class="engine soon" data-engine="prowl">
+          <span class="engine-dot"></span>
+          <span class="engine-body">
+            <span class="engine-name">Prowl</span>
+            <span class="engine-desc">به‌زودی در این نسخه</span>
+          </span>
+        </button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <a class="tg" id="tg" href="#">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M21.5 4.3 2.9 11.4c-.9.3-.9 1.6.1 1.9l4.6 1.4 1.7 5.2c.3.9 1.4 1 1.9.3l2.5-3 4.7 3.5c.7.5 1.7.1 1.9-.7l3.1-14.4c.2-.9-.7-1.6-1.9-1.3z"/>
+      </svg>
+      <span>کانال تلگرام ما</span>
+    </a>
+    <span class="foot-note">ساخته‌ی JMC</span>
+  </footer>
+
+  <div class="picker" id="picker" hidden>
+    <div class="picker-card" role="dialog" aria-label="انتخاب کشور خروجی">
+      <div class="picker-head">
+        <span class="picker-title">کشور خروجی</span>
+        <button class="icon-btn" id="pickerClose" aria-label="بستن">
+          <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+        </button>
+      </div>
+      <input class="picker-search" id="pickerSearch" type="text" placeholder="جستجوی کشور…" autocomplete="off" />
+      <div class="picker-list" id="pickerList"></div>
+    </div>
+  </div>
+
+  <script src="flags.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>
