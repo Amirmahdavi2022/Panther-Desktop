@@ -80,8 +80,8 @@ jobs:
           mkdir -p src-tauri/resources
           asset="aether-windows-x86_64.zip"
           base="https://github.com/CluvexStudio/Aether/releases/download/${AETHER_VERSION}"
-          curl -fsSL -o /tmp/aether.zip "$base/$asset"
-          curl -fsSL -o /tmp/aether.sha256 "$base/$asset.sha256" || true
+          curl -fsSL --retry 4 --retry-all-errors -o /tmp/aether.zip "$base/$asset"
+          curl -fsSL --retry 4 --retry-all-errors -o /tmp/aether.sha256 "$base/$asset.sha256" || true
           if [ -s /tmp/aether.sha256 ]; then
             want=$(tr -d '\r' < /tmp/aether.sha256 | awk '{print $1}')
             got=$(sha256sum /tmp/aether.zip | awk '{print $1}')
@@ -122,16 +122,45 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           cp /tmp/global.exe src-tauri/resources/global.exe
 
+      - name: Fetch the tunnel core
+        shell: bash
+        env:
+          SINGBOX_VERSION: "1.13.21"
+          # The release publishes no checksum file, so the hash of the archive
+          # that was reviewed is pinned here. A different file fails the build.
+          SINGBOX_SHA256: a03291793d3a3c6e266447a58140657ac099ff278abf3b8ff678932356a62ced
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/resources
+          name="sing-box-${SINGBOX_VERSION}-windows-amd64"
+          curl -fsSL --retry 4 --retry-all-errors -o /tmp/sing-box.zip \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${name}.zip"
+          got=$(sha256sum /tmp/sing-box.zip | awk '{print $1}')
+          if [ "$got" != "$SINGBOX_SHA256" ]; then
+            echo "sing-box checksum mismatch: expected $SINGBOX_SHA256, got $got" >&2
+            exit 1
+          fi
+          python -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" /tmp/sing-box.zip /tmp/sing-box
+          cp "/tmp/sing-box/${name}/sing-box.exe" src-tauri/resources/sing-box.exe
+
       - name: Refuse to ship without the core
         shell: bash
         run: |
           set -euo pipefail
           test -s src-tauri/resources/aether.exe
           test -s src-tauri/resources/global.exe
+          test -s src-tauri/resources/sing-box.exe
+          test -s src/flags.js
           test -s src-tauri/icons/icon.ico
           test -s src/logo.png
+          # A leftover root copy makes the Tauri CLI treat the repo root as
+          # the project folder, so catch it here instead of in the build.
+          test ! -e tauri.conf.json
+          test ! -e Cargo.toml
+          test -s src-tauri/tauri.conf.json
           echo "aether: $(wc -c < src-tauri/resources/aether.exe) bytes"
           echo "global: $(wc -c < src-tauri/resources/global.exe) bytes"
+          echo "sing-box: $(wc -c < src-tauri/resources/sing-box.exe) bytes"
 
       - name: Build the installer
         run: cargo tauri build --verbose
